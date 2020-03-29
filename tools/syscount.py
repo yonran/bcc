@@ -15,6 +15,7 @@ import errno
 import itertools
 import sys
 import signal
+import bcc
 from bcc import BPF
 from bcc.utils import printb
 from bcc.syscall import syscall_name, syscalls
@@ -43,6 +44,7 @@ def handle_errno(errstr):
 parser = argparse.ArgumentParser(
     description="Summarize syscall counts and latencies.")
 parser.add_argument("-p", "--pid", type=int, help="trace only this pid")
+parser.add_argument("--child-reaper-pid", type=int, help="trace only processes in the pid namespace whose init process has this pid (in the root pid namespace)")
 parser.add_argument("-i", "--interval", type=int,
     help="print summary at this interval (seconds)")
 parser.add_argument("-d", "--duration", type=int,
@@ -75,6 +77,10 @@ if args.list:
     sys.exit(0)
 
 text = """
+#include <linux/sched.h>
+#include <linux/pid_namespace.h>  // task_active_pid_ns, struct pid_namespace
+#include <linux/pid.h>
+
 #ifdef LATENCY
 struct data_t {
     u64 count;
@@ -86,6 +92,35 @@ BPF_HASH(data, u32, struct data_t);
 #else
 BPF_HASH(data, u32, u64);
 #endif
+BPF_HASH(count_by_ns, u32, u64);
+
+static inline int namespace_error() {
+#ifdef FILTER_REAPER_PID
+    struct task_struct *curtask =  (struct task_struct *)bpf_get_current_task();
+
+    // struct pid_namespace *ns2 = task_active_pid_ns(curtask); // = ns_of_pid(task_pid(curtask))
+
+    // the following two lines ns_of_pid(task_tgid(curtask)) are equivalent to task_active_pid_ns(curtask) from pid_namespace.h
+    struct pid *curtgid = curtask->group_leader->pids[PIDTYPE_PID].pid;  // = task_tgid(curtask) from sched.h
+    struct pid_namespace *ns = curtgid->numbers[curtgid->level].ns; // = ns_of_pid(curtid) from pid.h
+
+    // the reaper is the init process
+    struct task_struct *child_reaper = ns->child_reaper;
+    struct pid *child_reaper_pid = child_reaper->pids[PIDTYPE_PID].pid;  // = get_task_pid(child_reaper, PIDTYPE_PID);
+    int child_reaper_pid_nr = child_reaper_pid->numbers[0].nr;  // = pid_nr(child_reaper_pid)  from pid.h
+    u64 zero = 0, *val = count_by_ns.lookup_or_try_init(&child_reaper_pid_nr, &zero);
+    if (val) {
+        ++(*val);
+    }
+    if (child_reaper_pid_nr == FILTER_REAPER_PID) {
+        return 0;
+    } else {
+        return 1;
+    }
+#else
+    return 0;
+#endif
+}
 
 #ifdef LATENCY
 TRACEPOINT_PROBE(raw_syscalls, sys_enter) {
@@ -95,6 +130,10 @@ TRACEPOINT_PROBE(raw_syscalls, sys_enter) {
     if (pid_tgid >> 32 != FILTER_PID)
         return 0;
 #endif
+
+    if (0 != namespace_error()) {
+        return 0;
+    }
 
     u64 t = bpf_ktime_get_ns();
     start.update(&pid_tgid, &t);
@@ -126,6 +165,10 @@ TRACEPOINT_PROBE(raw_syscalls, sys_exit) {
     u32 key = args->id;
 #endif
 
+    if (0 != namespace_error()) {
+        return 0;
+    }
+
 #ifdef LATENCY
     struct data_t *val, zero = {};
     u64 *start_ns = start.lookup(&pid_tgid);
@@ -150,6 +193,8 @@ TRACEPOINT_PROBE(raw_syscalls, sys_exit) {
 
 if args.pid:
     text = ("#define FILTER_PID %d\n" % args.pid) + text
+if args.child_reaper_pid:
+    text = ("#define FILTER_REAPER_PID %d\n" % args.child_reaper_pid) + text
 if args.failures:
     text = "#define FILTER_FAILED\n" + text
 if args.errno:
@@ -162,13 +207,16 @@ if args.ebpf:
     print(text)
     exit()
 
-bpf = BPF(text=text)
+#bpf = BPF(text=text, debug=bcc.DEBUG_LLVM_IR | bcc.DEBUG_BPF | bcc.DEBUG_PREPROCESSOR | bcc.DEBUG_SOURCE | bcc.DEBUG_BPF_REGISTER_STATE | bcc.DEBUG_BTF)
+bpf = BPF(text=text, debug=bcc.DEBUG_SOURCE)
 
 def print_stats():
     if args.latency:
         print_latency_stats()
     else:
         print_count_stats()
+    if args.child_reaper_pid:
+        print_reaper_stats()
 
 agg_colname = "PID    COMM" if args.process else "SYSCALL"
 time_colname = "TIME (ms)" if args.milliseconds else "TIME (us)"
@@ -209,6 +257,16 @@ def print_latency_stats():
                 v.total_ns / (1e6 if args.milliseconds else 1e3)))
     print("")
     data.clear()
+
+def print_reaper_stats():
+    print("Reaper stats:")
+    count_by_ns = bpf["count_by_ns"]
+    for k, v in sorted(count_by_ns.items(), key=lambda kv: -kv[1].value):
+        if k.value == 0xffffffff:
+            continue
+        printb(b"%-6d %-15s %8d" % (k.value, comm_for_pid(k.value), v.value))
+    print("")
+    count_by_ns.clear()
 
 print("Tracing %ssyscalls, printing top %d... Ctrl+C to quit." %
       ("failed " if args.failures else "", args.top))
